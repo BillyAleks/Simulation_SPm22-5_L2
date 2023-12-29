@@ -1,13 +1,25 @@
 globals [
-  sky-top      ;; y coordinate of top row of sky
-  earth-top    ;; y coordinate of top row of earth
-  temperature  ;; overall temperature
+  sky-top                       ;; y coordinate of top row of sky
+  earth-top                     ;; y coordinate of top row of earth
+  temperature                   ;; overall temperature
+  message                       ;; variable for debugging
+  total-clouds                  ;; clouds counter
+  current-sunshine-source-pxcor ;; x coordinate of the sun position
+  current-sunshine-source-pycor ;; y coordinate of the sun position
+  sunshine-angle                ;; angle of the sun in current position
+  current-sector                ;; we introduce a term sectors, which presents a current sector of sun positioning one of 64, depending on a time of the day
+  total-trees                   ;; trees counter
+  sectors-x-step                ;; step size of moving between sectors by x coordinate
+  sectors-y-step                ;; step size of moving between sectors by y coordinate
+  sunshine-angle-step           ;; step of sunshine angle turning per one sector
+  co2-kill-count                ;; incremental variable to store the CO2 removal count
 ]
 
 breed [rays ray]     ;; packets of sunlight
 breed [IRs IR]       ;; packets of infrared radiation
 breed [heats heat]   ;; packets of heat energy
 breed [CO2s CO2]     ;; packets of carbon dioxide
+breed [trees tree]   ;; packets of trees tourtles
 
 breed [clouds cloud]
 clouds-own [cloud-speed cloud-id]
@@ -23,9 +35,24 @@ to setup
   set-default-shape clouds "cloud"
   set-default-shape heats "dot"
   set-default-shape CO2s "CO2-molecule"
+  set-default-shape trees "tree"
+  set total-clouds clouds-counter
+  set total-trees trees-counter
   setup-world
   set temperature 12
+  set current-sunshine-source-pxcor min-pxcor
+  set current-sunshine-source-pycor earth-top + 1
+  set sunshine-angle 90
+  set current-sector 1
+  set sectors-x-step (max-pxcor - min-pxcor) / 16
+  set sectors-y-step (max-pycor - earth-top + 1) / 8 ;; time to go up on the sunrise and down on the sunset
+  set sunshine-angle-step (270 - 90) / 32
   reset-ticks
+end
+
+to watch-logs [value] ;; debug function
+  let msg (word "Debug: " value)
+  set message msg
 end
 
 to setup-world
@@ -36,13 +63,15 @@ to setup-world
       set pcolor scale-color white pycor 22 15
     ]
     if pycor <= sky-top and pycor > earth-top [ ;; sky
-      set pcolor scale-color blue pycor -20 20
+      set pcolor scale-color sky pycor -20 20
     ]
     if pycor < earth-top
       [ set pcolor red + 3 ] ;; earth
     if pycor = earth-top ;; earth surface
       [ update-albedo ]
   ]
+  add-clouds clouds-counter
+  add-trees trees-counter
 end
 
 ;;
@@ -55,10 +84,43 @@ to go
   ;; if the albedo slider has moved update the color of the "earth surface" patches
   ask patches with [pycor = earth-top]
     [ update-albedo ]
+  if total-clouds != clouds-counter [
+    recalculate-clouds
+    set total-clouds clouds-counter
+  ]
+
+  if total-trees != trees-counter [
+    recalculate-trees
+    set total-trees trees-counter
+  ]
   run-heat  ;; step heat
   run-IR    ;; step IR
   run-CO2   ;; moves CO2 molecules
+  run-sky-coloring
+  run-CO2-cleanup
   tick
+end
+
+to run-sky-coloring
+  let sky-color blue
+  ask patches [
+    if pycor <= sky-top and pycor > earth-top [
+      if current-sector > 0 and current-sector < 11 [
+        set sky-color sky
+      ]
+      if current-sector > 10 and current-sector < 23 [
+        set sky-color blue
+      ]
+      if current-sector > 22 and current-sector < 33 [
+        set sky-color brown
+      ]
+      ifelse current-sector > 32 and current-sector < 65 [
+        set pcolor scale-color black pycor -2 27
+      ] [
+        set pcolor scale-color sky-color pycor -20 20
+      ]
+    ]
+  ]
 end
 
 to update-albedo ;; patch procedure
@@ -80,8 +142,9 @@ to add-cloud            ;; erase clouds and then create new ones, plus one
   if any? clouds
   [ set id max [cloud-id] of clouds + 1 ]
 
-  create-clouds 3 + random 20
-  [
+  ifelse cloud-by-groups [
+    create-clouds 1 + random 21
+    [
     set cloud-speed speed
     set cloud-id id
     ;; all the cloud turtles in each larger cloud should
@@ -97,9 +160,37 @@ to add-cloud            ;; erase clouds and then create new ones, plus one
     set size 2 + random 2
     set heading 90
   ]
+  ] [
+    create-clouds 1
+    [
+    set cloud-speed speed
+    set cloud-id id
+    ;; all the cloud turtles in each larger cloud should
+    ;; be nearby but not directly on top of the others so
+    ;; add a little wiggle room in the x and ycors
+    setxy x + random 9 - 4
+          ;; the clouds should generally be clustered around the
+          ;; center with occasional larger variations
+          y + 2.5 + random-float 2 - random-float 2
+    set color white
+    ;; varying size is also purely for visualization
+    ;; since we're only doing patch-based collisions
+    set size 2 + random 2
+    set heading 90
+  ]
+  ]
 end
 
-to remove-cloud       ;; erase clouds and then create new ones, minus one
+to add-clouds [clouds-count]            ;; add multiple clouds to the playground
+  let x 0
+
+  while [x < clouds-count] [
+    add-cloud
+    set x x + 1
+  ]
+end
+
+to remove-cloud       ;; erase a single cloud
   if any? clouds [
     let doomed-id one-of remove-duplicates [cloud-id] of clouds
     ask clouds with [cloud-id = doomed-id]
@@ -107,26 +198,116 @@ to remove-cloud       ;; erase clouds and then create new ones, minus one
   ]
 end
 
+to recalculate-clouds ;; to make smooth visualisation, we don't want to remove existing clouds by complete recreation, but just add new or remove existing independently
+  if clouds-counter = 0 [
+    ask clouds [die]
+    stop
+  ]
+
+  ifelse total-clouds > clouds-counter [
+    let diff total-clouds - clouds-counter
+    while [diff != 0] [
+      remove-cloud
+      set diff diff - 1
+    ]
+  ] [
+    let diff clouds-counter - total-clouds
+    while [diff != 0] [
+      add-cloud
+      set diff diff - 1
+    ]
+  ]
+end
+
+to recalculate-trees
+  if trees-counter = 0 [
+    ask trees [die]
+    stop
+  ]
+
+  ifelse total-trees > trees-counter [
+    let diff total-trees - trees-counter
+    while [diff != 0] [
+      remove-tree
+      set diff diff - 1
+    ]
+  ] [
+    let diff trees-counter - total-trees
+    while [diff != 0] [
+      add-tree
+      set diff diff - 1
+    ]
+  ]
+end
+
 to run-sunshine
   ask rays [
     if not can-move? 0.3 [ die ]  ;; kill them off at the edge
+    if xcor > max-pxcor [die]     ;; kill them off at the side edge
+    if xcor < min-pxcor [die]     ;; kill them off at the side edge
     fd 0.3                        ;; otherwise keep moving
   ]
   create-sunshine  ;; start new sun rays from top
   reflect-rays-from-clouds  ;; check for reflection off clouds
+  reflect-rays-from-trees ;; check for reflection off trees
   encounter-earth   ;; check for reflection off earth and absorption
 end
 
 to create-sunshine
+  ;; let's imagine our model space as a circle
+  ;; we will split it to 64 sectors, 32 will stand for the day time, and 32 for night time
+
+  if ticks mod 60 = 0 [
+    if current-sector < 8 [
+      ;; morning
+      set current-sunshine-source-pycor current-sunshine-source-pycor + sectors-y-step
+    ]
+
+    if current-sector > 7 and current-sector < 24 [
+      ;; day
+      set current-sunshine-source-pxcor current-sunshine-source-pxcor + sectors-x-step
+    ]
+
+    if current-sector > 23 and current-sector < 32 [
+      ;; evening
+      set current-sunshine-source-pycor current-sunshine-source-pycor - sectors-y-step
+    ]
+
+    ifelse current-sector = 64 [
+      ;; last sector of night
+      set current-sunshine-source-pxcor min-pxcor
+      set current-sunshine-source-pycor earth-top + 1
+      set sunshine-angle 90
+      set current-sector 1
+    ] [
+      set current-sector current-sector + 1
+    ]
+
+    set sunshine-angle sunshine-angle + sunshine-angle-step
+  ]
   ;; don't necessarily create a ray each tick
   ;; as brightness gets higher make more
-  if 10 * sun-brightness > random 50 [
+  if 10 * sun-brightness > random 50 and current-sector < 33 [
     create-rays 1 [
-      set heading 160
+      set heading sunshine-angle
       set color yellow
       ;; rays only come from a small area
       ;; near the top of the world
-      setxy (random 10) + min-pxcor max-pycor
+      if current-sunshine-source-pxcor + 4 >= max-pxcor and current-sunshine-source-pycor + 4 <= max-pycor [
+        setxy current-sunshine-source-pxcor current-sunshine-source-pycor + random 5
+      ]
+
+      if current-sunshine-source-pycor + 4 >= max-pycor and current-sunshine-source-pxcor + 4 <= max-pxcor [
+        setxy current-sunshine-source-pxcor + random 5 current-sunshine-source-pycor
+      ]
+
+      if current-sunshine-source-pycor + 4 >= max-pycor and current-sunshine-source-pxcor + 4 >= max-pxcor [
+        setxy current-sunshine-source-pxcor current-sunshine-source-pycor - random 3
+      ]
+
+      if current-sunshine-source-pycor + 4 <= max-pycor and current-sunshine-source-pxcor + 4 <= max-pxcor [
+        setxy current-sunshine-source-pxcor current-sunshine-source-pycor + random 5
+      ]
     ]
   ]
 end
@@ -137,11 +318,26 @@ to reflect-rays-from-clouds
  ]
 end
 
+to reflect-rays-from-trees
+ ask rays with [any? trees-here] [   ;; if ray shares patch with a tree
+   set heading 180 - heading   ;; turn the ray around
+ ]
+end
+
 to encounter-earth
   ask rays with [ycor <= earth-top] [
+    let absorbation-multiplier 1
+
+    if (current-sector > 0 and current-sector < 5) or (current-sector > 28 and current-sector < 33) [
+      set absorbation-multiplier 1.4
+    ]
+
+    if (current-sector > 4 and current-sector < 9) or (current-sector > 24 and current-sector < 29) [
+      set absorbation-multiplier 1.2
+    ]
     ;; depending on the albedo either
     ;; the earth absorbs the heat or reflects it
-    ifelse 100 * albedo > random 100
+    ifelse 100 * albedo * absorbation-multiplier > random 100
       [ set heading 180 - heading  ] ;; reflect
       [ rt random 45 - random 45 ;; absorb into the earth
         set color red - 2 + random 4
@@ -187,6 +383,29 @@ to run-IR
   ]
 end
 
+to add-tree ;; add one tree in a random position on the earth-top
+  create-trees 1 [
+    set color green
+    set size 2 + random 4
+    setxy random-xcor earth-top + 1
+  ]
+end
+
+to add-trees [trees-count] ;; add multiple trees in a random position on the earth-top (used for initial setup)
+  let x 0
+
+  while [x < trees-count] [
+    add-tree
+    set x x + 1
+  ]
+end
+
+to remove-tree ;; remove one random tree from the earth-top
+  if any? trees [
+    ask one-of trees [ die ]
+  ]
+end
+
 to add-CO2  ;; randomly adds 25 CO2 molecules to atmosphere
   let sky-height sky-top - earth-top
   create-CO2s 25 [
@@ -210,9 +429,75 @@ to run-CO2
     rt random 51 - 25 ;; turn a bit
     let dist 0.05 + random-float 0.1
     ;; keep the CO2 in the sky area
-    if [not shade-of? blue pcolor] of patch-ahead dist
-      [ set heading 180 - heading ]
+
+    if [pycor] of patch-ahead 1 <= earth-top [
+      ;; we have to care about some exidentely created turtles in wrong place
+      ifelse pycor > earth-top [
+        set heading 180 - heading
+      ] [
+        set heading 0
+      ]
+      while [[pycor] of patch-ahead 1 < earth-top][
+        fd dist
+      ]
+    ]
+
+    if [pycor] of patch-ahead 1 >= sky-top [
+      ;; we have to care about some exidentely created turtles in wrong place
+      ifelse pycor < sky-top [
+        set heading 180 - heading
+      ] [
+        set heading 180
+      ]
+      while [[pycor] of patch-ahead 1 > sky-top][
+        fd dist
+      ]
+    ]
+
     fd dist ;; move forward a bit
+  ]
+end
+
+to run-CO2-cleanup
+  ;; rough formula of cleaning up an air from CO2:
+  ;; 1m3 of trees consumps 1tonn of CO2 per day
+  ;; lets consider 1 tree have to kill 1 CO2 per day along with normal conditions
+  ;; additional rules:
+  ;; - night time - no CO2 reducing
+  ;; - morning and evening time - low reducing
+  ;; - day time - normal reducing
+  ;; - clouds affects CO2 transforming
+  ;; - sunshine affects CO2 transforming
+  let daytime-multiplier 0
+  if current-sector < 8 [
+    ;; morning
+    set daytime-multiplier 0.5
+  ]
+
+  if current-sector > 7 and current-sector < 24 [
+    ;; day
+    set daytime-multiplier 1
+
+  ]
+
+  if current-sector > 23 and current-sector < 32 [
+    ;; evening
+    set daytime-multiplier 0.5
+  ]
+
+  ;; to make it closer to reality, we may want to reduce CO2 along the day
+  if ticks mod 1 = 0 [
+    if any? CO2s [
+      set co2-kill-count co2-kill-count + total-trees / 32 / 60 * daytime-multiplier * sun-brightness / (1 + total-clouds / 100)
+      let allowed-killing-number count CO2s - co2-kill-count
+      ifelse allowed-killing-number >= 0 [
+        ask n-of int co2-kill-count CO2s [die]
+        set co2-kill-count co2-kill-count - int co2-kill-count
+      ] [
+        ask n-of count CO2s CO2s [die]
+        set co2-kill-count 0
+      ]
+    ]
   ]
 end
 
@@ -283,14 +568,14 @@ NIL
 
 SLIDER
 18
-47
+52
 191
-80
+85
 sun-brightness
 sun-brightness
 0
 5
-1.0
+5.0
 0.2
 1
 NIL
@@ -298,9 +583,9 @@ HORIZONTAL
 
 SLIDER
 18
-82
+87
 191
-115
+120
 albedo
 albedo
 0
@@ -312,10 +597,10 @@ NIL
 HORIZONTAL
 
 PLOT
-9
-212
-278
-423
+10
+251
+279
+462
 Global Temperature
 NIL
 NIL
@@ -330,10 +615,10 @@ PENS
 "default" 1.0 0 -2674135 true "" "plot temperature"
 
 BUTTON
-7
-152
-102
-185
+9
+203
+104
+236
 add CO2
 add-CO2
 NIL
@@ -347,10 +632,10 @@ NIL
 0
 
 BUTTON
-104
-152
-199
-185
+106
+203
+201
+236
 remove CO2
 remove-CO2
 NIL
@@ -373,40 +658,6 @@ temperature
 1
 1
 11
-
-BUTTON
-7
-118
-102
-151
-add cloud
-add-cloud
-NIL
-1
-T
-OBSERVER
-NIL
-NIL
-NIL
-NIL
-0
-
-BUTTON
-104
-118
-199
-151
-remove cloud
-remove-cloud
-NIL
-1
-T
-OBSERVER
-NIL
-NIL
-NIL
-NIL
-0
 
 MONITOR
 210
@@ -435,6 +686,76 @@ NIL
 NIL
 NIL
 0
+
+SLIDER
+17
+161
+194
+194
+clouds-counter
+clouds-counter
+0
+200
+0.0
+1
+1
+NIL
+HORIZONTAL
+
+MONITOR
+316
+372
+775
+417
+Debug
+message
+17
+1
+11
+
+SLIDER
+17
+123
+192
+156
+trees-counter
+trees-counter
+0
+100
+1.0
+1
+1
+NIL
+HORIZONTAL
+
+SWITCH
+315
+432
+487
+465
+cloud-by-groups
+cloud-by-groups
+0
+1
+-1000
+
+PLOT
+10
+480
+279
+682
+CO2 level
+Ticks
+CO2 amount
+0.0
+10.0
+0.0
+10.0
+true
+false
+"" ""
+PENS
+"CO2 level" 1.0 0 -16777216 true "" "plot count CO2s"
 
 @#$#@#$#@
 ## WHAT IS IT?
